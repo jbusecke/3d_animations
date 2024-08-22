@@ -3,6 +3,7 @@ import geovista as gv
 from dataclasses import dataclass
 from tqdm.auto import tqdm
 import xarray as xr
+import numpy as np
 
 @dataclass
 class Movie:
@@ -16,7 +17,10 @@ class Movie:
     lat_name:str = 'lat'
     background_color:str = 'black'
     base_color = 'gray'
+    base_texture=None
     camera_path:pv.core.pointset.PolyData = None
+    geoplotter_kwargs=None
+
 
     def __post_init__(self):
         dims = set([self.x_dim, self.y_dim])
@@ -36,81 +40,87 @@ class Movie:
         other_dims = [dim for dim in list(self.da.dims) if dim not in [self.time_dim, self.x_dim, self.y_dim]]
         self.da = self.da.transpose(*['x', 'y', 'time']+other_dims)
         # I am not subsampling yet, but I should probably init it here to be consitent?
+
+        #Assume that the nan mask does not change
+        self.nanmask = ~np.isnan(self.da.isel({self.time_dim:0})).reset_coords(drop=True).load()
+
+        # mask out the coordinates
+        for co in [self.lon_name, self.lat_name]:
+            self.da = self.da.assign_coords({co:self.da.coords[co].where(self.nanmask)})
         
         # infer frames
-        self.frames = range(len(self.da[self.time_dim]))        
-        
+        self.frames = range(len(self.da[self.time_dim]))
 
-    def _get_plotter(self,**geoplotter_kwargs):
-        p = gv.GeoPlotter(**geoplotter_kwargs)
-        p.add_base_layer(color=self.base_color)
-        p.background_color=self.background_color
-        return p
+        # set defaults
+        if self.geoplotter_kwargs is None:
+            self.geoplotter_kwargs = {}
+
+        self.plotter = gv.GeoPlotter(**self.geoplotter_kwargs)
+        if self.base_color or self.base_texture:
+            self.plotter.add_base_layer(color=self.base_color, texture=self.base_texture)            
 
     def _get_empty_mesh(self):
-        return gv.Transform.from_2d(
+        mesh = gv.Transform.from_2d(
             self.da[self.lon_name], 
             self.da[self.lat_name]
         )
+        print(mesh)
+        print(self.nanmask.data.flatten().shape)
+        # mesh.remove_cells(self.nanmask.data.flatten(), inplace=True)
+        return mesh
 
     def _get_frame(self,frame):
         da_frame = self.da.isel({self.time_dim:frame}).drop_vars('time')
-        nanmask = ~np.isnan(da_frame).reset_coords(drop=True)
-
-        for co in [self.lon_name, self.lat_name]:
-            da_frame = da_frame.assign_coords({co:da_frame.coords[co].where(nanmask)})
         return da_frame
 
-    def _update_mesh(self,mesh, da_frame, plotter, name='data-frame'):
+    def _update_mesh(self,mesh, da_frame):
         # set the active scalar with the data payload for the frame
-        mesh[name] = da_frame.data.flatten()
+        # get name from xarray
+        mesh[da_frame.name] = da_frame.data.flatten()
 
-        # threshold the mesh - this can change the mesh geometry each frame,
-        # so create a separate "frame" mesh
-        frame_mesh = mesh.threshold()
+        # # threshold the mesh - this can change the mesh geometry each frame,
+        # # so create a separate "frame" mesh
+        # frame_mesh = mesh.threshold()
+        frame_mesh = mesh
 
         # this will add the named "data-frame" mesh to the plotter or replace it
-        actor = plotter.add_mesh(
+        actor = self.plotter.add_mesh(
             frame_mesh, 
-            name=name,
             cmap=self.cmap,
             clim=self.clim,
         )
         return actor
 
-    def set_frame(self, frame, plotter, mesh):
+    def set_frame(self, frame, mesh):
         da_frame = self._get_frame(frame)
-        a = self._update_mesh(mesh, da_frame, plotter)
+        a = self._update_mesh(mesh, da_frame)
         if self.camera_path:
-            self._update_camera(frame, plotter)
+            self._update_camera(frame)
         return a
-        
-        
 
-    def _update_camera(self, frame, plotter):
-        plotter.set_position(self.camera_path.points[frame, :])
-        plotter.camera.focal_point = (0, 0, 0)
-        plotter.camera.roll = -90
+    def _update_camera(self, frame):
+        self.plotter.set_position(self.camera_path.points[frame, :])
+        self.plotter.camera.focal_point = (0, 0, 0)
+        self.plotter.camera.roll = -90
         
     def preview(self, frame):
         pv.global_theme.trame.interactive_ratio = 0.75 #1 or 2 
         pv.global_theme.trame.still_ratio = 4
-        window_size = None
-        p = self._get_plotter(window_size=window_size)
+
         mesh = self._get_empty_mesh()
-        a = self.set_frame(frame, p, mesh)
-        
+        a = self.set_frame(frame, mesh)
         p.show()
 
-    def render(self, filename, resolution: list=[3840, 2160]):
+    def render(self, filename, resolution: list=[1920, 1088]):
         #(does this affect the movie quality?)
         pv.global_theme.trame.interactive_ratio = 5 #1 or 2 (does this affect the movie quality?)
         pv.global_theme.trame.still_ratio = 5
-        p = self._get_plotter(window_size=(resolution))
+        # set the window size to the given resolution
+        self.plotter.window_size = resolution
         mesh = self._get_empty_mesh()
-        p.open_movie(filename)
+        self.plotter.open_movie(filename)
         for frame in tqdm(self.frames):
-            a = self.set_frame(frame, p, mesh)
+            a = self.set_frame(frame, mesh)
             da_frame = self._get_frame(frame)
-            p.write_frame()
-        p.close()
+            self.plotter.write_frame()
+        self.plotter.close()
